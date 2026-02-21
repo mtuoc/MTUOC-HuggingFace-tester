@@ -1,163 +1,124 @@
 import tkinter as tk
-from tkinter import messagebox, ttk, filedialog
-from tkinter.scrolledtext import ScrolledText
+from tkinter import messagebox, scrolledtext, ttk
 import threading
-import re
-from huggingface_hub import scan_cache_dir
-from transformers import pipeline
-import torch
+from hf_engine import HFModelEngine
 
-class HFApp:
-    def __init__(self, master):
-        self.master = master
-        self.master.title("MTUOC HuggingFace Tester Pro")
-        self.master.geometry("1700x1200")
+class MTUOCTesterGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("MTUOC HuggingFace Tester")
+        self.root.geometry("1000x1200")
         
-        self.pipe = None
-        self.model_name = tk.StringVar(value="gpt2")
-        self.do_sample = tk.BooleanVar(value=False)
-        self.early_stopping = tk.BooleanVar(value=True)
+        # Inicialitzem el motor de Hugging Face
+        self.engine = HFModelEngine("config.yaml")
+        if not self.engine.config:
+            messagebox.showerror("Error Crític", "No s'ha trobat el fitxer config_tester.yaml o és invàlid.")
+            self.root.destroy()
+            return
 
-        self.style = ttk.Style()
-        self.master.option_add('*TCombobox*Listbox.font', ('Segoe UI', 10))
-        
         self.setup_ui()
-        self.refresh_local_models() 
+        
+        # Iniciem la càrrega del model en un fil separat
+        # Passem 'self.update_button_status' com a callback per actualitzar el botó
+        threading.Thread(target=self.engine.load_model, 
+                         args=(self.update_button_status,), 
+                         daemon=True).start()
 
     def setup_ui(self):
-        self.master.columnconfigure(0, weight=1)
-        self.master.rowconfigure(3, weight=1) # Donem pes a la fila de la Resposta
+        """Configura la interfície gràfica."""
+        main_frame = tk.Frame(self.root, padx=25, pady=20)
+        main_frame.pack(fill="both", expand=True)
 
-        # ──── 1. Selecció de Model ────
-        model_frame = tk.LabelFrame(self.master, text="Model Selection", padx=20, pady=5)
-        model_frame.grid(row=0, column=0, sticky="ew", padx=15, pady=5)
-        model_frame.columnconfigure(0, weight=1)
+        # 1. Indicador del Model
+        model_name = self.engine.config['model_settings']['name']
+        tk.Label(main_frame, text=f"Model: {model_name}", fg="#666", font=("Arial", 9)).pack(anchor="e")
+
+        # 2. Entrada de text (Prompt)
+        tk.Label(main_frame, text="INPUT PROMPT", font=("Arial", 10, "bold")).pack(anchor="w")
+        self.input_txt = scrolledtext.ScrolledText(main_frame, height=10, font=("Consolas", 11))
+        self.input_txt.pack(fill="both", expand=True, pady=(5, 15))
+
+        # 3. Botó d'acció (amb estats dinàmics)
+        # Inicialment en gris (LOADING)
+        self.btn_gen = tk.Button(
+            main_frame, 
+            text="LOADING MODEL...", 
+            bg="#9E9E9E", 
+            fg="white", 
+            state="disabled",
+            font=("Arial", 11, "bold"), 
+            pady=10,
+            command=self.on_generate
+        )
+        self.btn_gen.pack(fill="x", pady=5)
+
+        # 4. Resposta Bruta (Raw)
+        tk.Label(main_frame, text="FULL MODEL RESPONSE", font=("Arial", 10, "bold")).pack(anchor="w", pady=(15, 0))
+        self.raw_out = scrolledtext.ScrolledText(main_frame, height=8, font=("Consolas", 10), bg="#F5F5F5")
+        self.raw_out.pack(fill="both", expand=True, pady=5)
+
+        # 5. Configuració de filtratge (Regex)
+        regex_frame = tk.LabelFrame(main_frame, text=" Filter Settings (JSON + Regex) ", padx=15, pady=10)
+        regex_frame.pack(fill="x", pady=15)
+
+        tk.Label(regex_frame, text="Regex Pattern:").pack(side="left")
+        self.reg_entry = tk.Entry(regex_frame, font=("Consolas", 11))
+        self.reg_entry.pack(side="left", fill="x", expand=True, padx=10)
         
-        self.model_combo = ttk.Combobox(model_frame, textvariable=self.model_name, font=('Segoe UI', 10))
-        self.model_combo.grid(row=0, column=0, columnspan=3, sticky="ew", pady=5)
-        
-        btn_row_frame = tk.Frame(model_frame)
-        btn_row_frame.grid(row=1, column=0, columnspan=3, sticky="w")
-        tk.Button(btn_row_frame, text=" 📁 Browse ", command=self.browse_model_folder, font=('Segoe UI', 9)).pack(side="left", padx=5)
-        tk.Button(btn_row_frame, text=" 🔄 Refresh ", command=self.refresh_local_models, font=('Segoe UI', 9)).pack(side="left", padx=5)
-        tk.Button(btn_row_frame, text=" LOAD MODEL ", command=self.load_model, bg="#2196F3", fg="white", font=('Segoe UI', 9, 'bold'), padx=15).pack(side="left", padx=20)
+        # Carreguem el regex per defecte del YAML
+        def_reg = self.engine.config.get('prompt_settings', {}).get('regex_pattern', "")
+        if def_reg and def_reg != "None":
+            self.reg_entry.insert(0, def_reg)
 
-        # ──── 2. Paràmetres ────
-        param_frame = tk.LabelFrame(self.master, text="Parameters", padx=15, pady=5)
-        param_frame.grid(row=1, column=0, sticky="ew", padx=15, pady=5)
-        self.params = {
-            "max_new_tokens": tk.IntVar(value=100),
-            "num_beams": tk.IntVar(value=5),
-            "repetition_penalty": tk.DoubleVar(value=1.1),
-            "no_repeat_ngram_size": tk.IntVar(value=3),
-            "temperature": tk.DoubleVar(value=0.9),
-            "top_p": tk.DoubleVar(value=0.95),
-        }
-        for i, (k, v) in enumerate(self.params.items()):
-            r, c = divmod(i, 4) 
-            tk.Label(param_frame, text=f"{k}:", font=('Segoe UI', 8)).grid(row=r, column=c*2, sticky="w", padx=(10, 2))
-            tk.Entry(param_frame, textvariable=v, width=8, font=('Segoe UI', 9)).grid(row=r, column=c*2+1, sticky="w")
-        tk.Checkbutton(param_frame, text="do_sample", variable=self.do_sample, font=('Segoe UI', 9, 'bold')).grid(row=0, column=8, padx=20)
+        # 6. Resultat Final (Filtrat)
+        tk.Label(main_frame, text="FINAL FILTERED RESULT", font=("Arial", 10, "bold"), fg="#2E7D32").pack(anchor="w")
+        self.final_out = scrolledtext.ScrolledText(main_frame, height=6, font=("Consolas", 12, "bold"), bg="#F1F8E9")
+        self.final_out.pack(fill="both", expand=True, pady=5)
 
-        # ──── 3. Prompt (Compacte) ────
-        prompt_frame = tk.LabelFrame(self.master, text="Input Prompt", padx=15, pady=5)
-        prompt_frame.grid(row=2, column=0, sticky="ew", padx=15, pady=5)
-        self.prompt_text = ScrolledText(prompt_frame, height=4, font=('Consolas', 10))
-        self.prompt_text.pack(fill="both", expand=True)
-
-        # ──── 4. Resposta del Model (Més gran: 15 línies) ────
-        response_frame = tk.LabelFrame(self.master, text="Model Response", padx=15, pady=5)
-        response_frame.grid(row=3, column=0, sticky="nsew", padx=15, pady=5)
-        self.response_text = ScrolledText(response_frame, height=15, font=('Consolas', 10), bg="#fcfcfc")
-        self.response_text.pack(fill="both", expand=True)
-
-        # ──── 5. Botons d'Acció ────
-        btn_frame = tk.Frame(self.master)
-        btn_frame.grid(row=4, column=0, pady=5)
-        self.gen_button = tk.Button(btn_frame, text="GENERATE TEXT", command=self.send_prompt, bg="#4CAF50", fg="white", font=('Segoe UI', 10, 'bold'), padx=25, pady=8)
-        self.gen_button.pack(side="left", padx=10)
-        tk.Button(btn_frame, text="Clear Everything", command=self.clear_all, font=('Segoe UI', 9), padx=15).pack(side="left", padx=10)
-
-        # ──── 6. Regex (Reduït: 3 línies) ────
-        regex_frame = tk.LabelFrame(self.master, text="Regex Filter", padx=15, pady=5)
-        regex_frame.grid(row=5, column=0, sticky="ew", padx=15, pady=5)
-        tk.Label(regex_frame, text="Pattern:", font=('Segoe UI', 9, 'bold')).pack(anchor="w")
-        self.regexp_entry = tk.Entry(regex_frame, font=('Consolas', 10))
-        self.regexp_entry.pack(fill="x", pady=2)
-        
-        self.regexp_result = ScrolledText(regex_frame, height=3, bg="#f3f3f3", font=('Consolas', 10))
-        self.regexp_result.pack(fill="x", pady=5)
-        tk.Button(regex_frame, text="Apply Filter", command=self.apply_regexp, font=('Segoe UI', 9)).pack(pady=2)
-
-    def refresh_local_models(self):
-        try:
-            cache_info = scan_cache_dir()
-            models = sorted([repo.repo_id for repo in cache_info.repos if repo.repo_type == "model"])
-            self.model_combo['values'] = models
-            if models: self.model_combo.set(models[0])
-        except Exception: self.model_combo.set("gpt2")
-
-    def browse_model_folder(self):
-        folder = filedialog.askdirectory()
-        if folder: self.model_name.set(folder)
-
-    def load_model(self):
-        def _load():
-            m = self.model_name.get().strip()
-            try:
-                self.pipe = pipeline("text-generation", model=m, device=0 if torch.cuda.is_available() else -1)
-                messagebox.showinfo("Success", f"Model loaded: {m}")
-            except Exception as e: messagebox.showerror("Error", str(e))
-        threading.Thread(target=_load, daemon=True).start()
-
-    def send_prompt(self):
-        if not self.pipe:
-            messagebox.showwarning("Warning", "Load a model first.")
-            return
-        prompt = self.prompt_text.get("1.0", "end").strip()
-        if not prompt: return
-
-        self.gen_button.config(state="disabled", text="GENERATING...", bg="#9e9e9e")
-
-        gen_kwargs = {
-            "max_new_tokens": self.params["max_new_tokens"].get(),
-            "repetition_penalty": self.params["repetition_penalty"].get(),
-            "no_repeat_ngram_size": self.params["no_repeat_ngram_size"].get(),
-            "do_sample": self.do_sample.get(),
-            "pad_token_id": self.pipe.tokenizer.eos_token_id or 0
-        }
-        if self.do_sample.get():
-            gen_kwargs["temperature"] = self.params["temperature"].get()
-            gen_kwargs["top_p"] = self.params["top_p"].get()
+    def update_button_status(self, status):
+        """Actualitza el botó segons l'estat del motor (thread-safe)."""
+        if status == "READY":
+            self.btn_gen.config(state="normal", text="GENERATE TEXT", bg="#4CAF50") # Verd
+        elif "ERROR" in status:
+            self.btn_gen.config(state="disabled", text=f"LOAD ERROR", bg="#F44336") # Vermell
+            messagebox.showerror("Error de càrrega", status)
         else:
-            gen_kwargs["num_beams"] = self.params["num_beams"].get()
+            # LOADING o GENERATING
+            self.btn_gen.config(state="disabled", text=status, bg="#9E9E9E")
 
-        def _generate():
+    def on_generate(self):
+        """Gestiona la petició de generació."""
+        prompt = self.input_txt.get("1.0", "end").strip()
+        regex = self.reg_entry.get().strip()
+        
+        if not prompt:
+            return
+
+        def run_inference():
+            # Bloquegem el botó mentre genera
+            self.btn_gen.config(state="disabled", text="GENERATING...", bg="#FF9800") # Taronja
+            
             try:
-                res = self.pipe(prompt, **gen_kwargs)
-                self.response_text.delete("1.0", "end")
-                self.response_text.insert("end", res[0]['generated_text'])
-            except Exception as e: messagebox.showerror("Error", str(e))
-            finally: self.gen_button.config(state="normal", text="GENERATE TEXT", bg="#4CAF50")
+                # Cridem al motor (retorna raw i processed)
+                raw, final = self.engine.generate(prompt, override_regex=regex)
+                
+                # Actualitzem la interfície (usant delete/insert)
+                self.raw_out.delete("1.0", "end")
+                self.raw_out.insert("end", raw)
+                
+                self.final_out.delete("1.0", "end")
+                self.final_out.insert("end", final)
+                
+            except Exception as e:
+                messagebox.showerror("Error de Generació", str(e))
+            finally:
+                # Tornem el botó a l'estat READY
+                self.update_button_status("READY")
 
-        threading.Thread(target=_generate, daemon=True).start()
-
-    def clear_all(self):
-        for w in [self.prompt_text, self.response_text, self.regexp_result]: w.delete("1.0", "end")
-        self.regexp_entry.delete(0, "end")
-
-    def apply_regexp(self):
-        pat = self.regexp_entry.get().strip()
-        txt = self.response_text.get("1.0", "end").strip()
-        self.regexp_result.delete("1.0", "end")
-        if not pat: return
-        try:
-            matches = re.findall(pat, txt, re.MULTILINE)
-            out = "\n".join([" | ".join(map(str, m)) if isinstance(m, tuple) else str(m) for m in matches])
-            self.regexp_result.insert("end", out or "[No matches]")
-        except Exception as e: self.regexp_result.insert("end", f"Error: {e}")
+        # Executem la inferència en un fil per no congelar la GUI
+        threading.Thread(target=run_inference, daemon=True).start()
 
 if __name__ == "__main__":
     root = tk.Tk()
-    HFApp(root)
+    app = MTUOCTesterGUI(root)
     root.mainloop()
